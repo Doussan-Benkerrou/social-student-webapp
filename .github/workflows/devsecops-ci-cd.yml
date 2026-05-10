@@ -1,0 +1,248 @@
+name: DevSecOps CI/CD
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: devsecops-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  CI: "true"
+  NEXT_TELEMETRY_DISABLED: "1"
+  NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL || 'https://example.supabase.co' }}
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'ci_supabase_anon_key' }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || 'ci_supabase_service_role_key' }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || 'ci_gemini_api_key' }}
+  NEXT_PUBLIC_GEMINI_CHAT_MODEL: ${{ secrets.NEXT_PUBLIC_GEMINI_CHAT_MODEL || 'gemini-2.5-flash' }}
+  NEXT_PUBLIC_GEMINI_IMAGE_MODEL: ${{ secrets.NEXT_PUBLIC_GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image' }}
+  GEMINI_CHAT_MODEL: ${{ secrets.GEMINI_CHAT_MODEL || 'gemini-2.5-flash' }}
+  GEMINI_IMAGE_MODEL: ${{ secrets.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image' }}
+
+jobs:
+  build-test:
+    name: Build, lint, typecheck and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint source code
+        run: npm run lint
+
+      - name: TypeScript type check
+        run: npm run typecheck
+
+      - name: Run unit tests
+        run: npm test -- --ci
+
+      - name: Compile Next.js application
+        run: npm run build
+
+      - name: Generate Next.js build artifacts
+        run: npm run build:generate
+
+      - name: Upload production build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-production-build
+          retention-days: 7
+          path: |
+            .next/
+            public/
+            package.json
+            package-lock.json
+            next.config.ts
+            README.md
+
+  secret-scan:
+    name: Secret detection with Gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_ENABLE_SUMMARY: true
+
+  sast-codeql:
+    name: SAST with CodeQL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-and-quality
+
+      - name: Compile for CodeQL analysis
+        run: npm run build
+
+      - name: Generate build artifacts for CodeQL
+        run: npm run build:generate
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"
+
+  sca-trivy:
+    name: SCA with Trivy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan dependencies, IaC and repository files
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          scanners: vuln,misconfig,secret
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF report to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Upload Trivy report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sca-report
+          retention-days: 7
+          path: trivy-results.sarif
+
+  dast-zap:
+    name: DAST with OWASP ZAP
+    runs-on: ubuntu-latest
+    needs: build-test
+    env:
+      ZAP_AUTH_HEADER: Authorization
+      ZAP_AUTH_HEADER_VALUE: Bearer ${{ secrets.ZAP_AUTH_TOKEN || 'ci_zap_placeholder' }}
+      ZAP_AUTH_HEADER_SITE: http://127.0.0.1:3000
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Compile application
+        run: npm run build
+
+      - name: Generate application build artifacts
+        run: npm run build:generate
+
+      - name: Start application for DAST
+        run: |
+          npm run start -- --hostname 127.0.0.1 --port 3000 > next-server.log 2>&1 &
+          echo $! > next-server.pid
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:3000/api/health > /dev/null; then
+              echo "Next.js application is ready for ZAP."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Next.js application did not start in time."
+          cat next-server.log
+          exit 1
+
+      - name: Run OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          docker_name: ghcr.io/zaproxy/zaproxy:stable
+          target: http://127.0.0.1:3000
+          cmd_options: "-a -j -m 5 -T 60 -I"
+          allow_issue_writing: false
+          fail_action: true
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-dast-report
+          retention-days: 7
+          path: |
+            report_html.html
+            report_json.json
+            report_md.md
+            next-server.log
+
+  delivery-artifact:
+    name: Continuous delivery artifact
+    runs-on: ubuntu-latest
+    needs: [build-test, secret-scan, sast-codeql, sca-trivy, dast-zap]
+    if: github.event_name == 'push'
+    steps:
+      - name: Download production build
+        uses: actions/download-artifact@v4
+        with:
+          name: next-production-build
+          path: delivery
+
+      - name: Create delivery summary
+        run: |
+          echo "# Delivery artifact" > delivery-summary.md
+          echo "The application passed CI, SAST, SCA, secret detection and DAST." >> delivery-summary.md
+          echo "Branch: $GITHUB_REF_NAME" >> delivery-summary.md
+          echo "Commit: $GITHUB_SHA" >> delivery-summary.md
+
+      - name: Upload delivery summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-summary
+          retention-days: 14
+          path: delivery-summary.md
